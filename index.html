@@ -509,7 +509,7 @@
     var d=document.getElementById('debug');
     if (d.className==='hidden') {
       d.className='';
-      var sample=lastDeviceData && lastDeviceData.length ? lastDeviceData[0] : null;
+      var sample=lastDeviceData && lastDeviceData.length ? lastDeviceData : null;
       d.innerHTML='Latest Nightscout device-status shape (for troubleshooting only):\n\n'+
         (sample ? JSON.stringify(sample,null,2) : 'No device-status record received.');
       this.innerHTML='Hide data check';
