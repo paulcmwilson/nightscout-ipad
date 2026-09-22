@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="format-detection" content="telephone=no">
-  <title>Nightscout Loop Display</title>
+  <title>Nightscout AID Display</title>
   <style>
     html, body { margin:0; padding:0; background:#000; color:#fff; font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif; }
     * { box-sizing:border-box; }
@@ -67,8 +67,8 @@
 </head>
 <body>
 <div id="setup" class="hidden">
-  <h1>Nightscout Loop Display</h1>
-  <p>Enter your Nightscout address. A read-only access token is optional and can be added later when you make Nightscout private.</p>
+  <h1>Nightscout AID Display</h1>
+  <p>Enter your Nightscout address. The display automatically uses the newest Loop or Trio/OpenAPS data it can find.</p>
   <label for="nsurl">Nightscout URL</label>
   <input id="nsurl" type="url" placeholder="https://your-nightscout.onrender.com" autocapitalize="none" autocomplete="off" spellcheck="false">
   <label for="nstoken">Read-only token (optional)</label>
@@ -87,8 +87,8 @@
       <div id="delta">-- mmol/L <span id="age"></span></div>
     </div>
     <div class="statusbox">
-      <div id="loopStatus">LOOP --</div>
-      <div id="loopAge">waiting for Loop data</div>
+      <div id="loopStatus">AID --</div>
+      <div id="loopAge">waiting for AID data</div>
       <div id="updated"></div>
     </div>
   </div>
@@ -98,7 +98,7 @@
     <div class="tile"><div class="label">COB</div><div id="cob" class="value">--</div><div class="small">grams</div></div>
     <div class="tile"><div class="label">Basal</div><div id="basal" class="value">--</div><div id="basalSub" class="small">U/hr</div></div>
     <div class="tile"><div class="label">Reservoir</div><div id="reservoir" class="value">--</div><div class="small">units</div></div>
-    <div class="tile"><div class="label">Recommended bolus</div><div id="recBolus" class="value">--</div><div class="small">units</div></div>
+    <div class="tile"><div class="label">Recommended bolus</div><div id="recBolus" class="value">--</div><div class="small">units · check app</div></div>
     <div class="tile"><div class="label">Last bolus</div><div id="lastBolus" class="value">--</div><div id="lastBolusSub" class="small"></div></div>
   </div>
 
@@ -106,7 +106,7 @@
     <canvas id="chart" width="900" height="265"></canvas>
     <div class="legend">
       <span><span class="key"></span>glucose</span>
-      <span><span class="key pred"></span>Loop prediction</span>
+      <span><span class="key pred"></span><span id="predictionLabel">prediction</span></span>
     </div>
   </div>
 
@@ -168,7 +168,7 @@
 
   function recordDate(o) {
     if (!o) return null;
-    return when(o.created_at || o.timestamp || o.dateString || o.date);
+    return when(o.created_at || o.timestamp || o.dateString || o.date || o.time || o.deliverAt);
   }
 
   function ageMinutes(d) {
@@ -246,7 +246,37 @@
     return best;
   }
 
-  function predictedFrom(loopObj) {
+  function latestTrio(arr) {
+    var best = null, bestDate = null, i, d, isTrio;
+    if (!arr || !arr.length) return null;
+    for (i=0; i<arr.length; i++) {
+      if (!arr[i]) continue;
+      isTrio = (String(arr[i].device || '').toLowerCase() === 'trio') || (!!arr[i].openaps && !arr[i].loop);
+      if (!isTrio || !arr[i].openaps) continue;
+      d = recordDate(arr[i]) || recordDate(arr[i].openaps);
+      if (!best || (d && (!bestDate || d > bestDate))) {
+        best = arr[i]; bestDate = d;
+      }
+    }
+    return best;
+  }
+
+  function latestPumpWithReservoir(arr) {
+    var best = null, bestDate = null, i, d, r;
+    if (!arr || !arr.length) return null;
+    for (i=0; i<arr.length; i++) {
+      if (!arr[i] || !arr[i].pump) continue;
+      r = num(firstPath(arr[i].pump, [['reservoir'],['reservoir','units'],['status','reservoir']]));
+      if (r === null || r <= 0) continue;
+      d = recordDate(arr[i]) || recordDate(arr[i].pump);
+      if (!best || (d && (!bestDate || d > bestDate))) {
+        best = arr[i]; bestDate = d;
+      }
+    }
+    return best;
+  }
+
+  function predictedFromLoop(loopObj) {
     if (!loopObj) return [];
     var p = firstPath(loopObj, [['predicted'],['prediction'],['predictedGlucose']]);
     var vals, start, interval, out = [], i, v, d;
@@ -269,21 +299,71 @@
     return out;
   }
 
-  function setLoopStatus(ds) {
+  function arrayPrediction(vals, start) {
+    var out = [], i, v;
+    if (!vals || typeof vals.length === 'undefined' || !start) return out;
+    for (i=0; i<vals.length; i++) {
+      v = num(vals[i]);
+      if (v !== null) out.push({t:new Date(start.getTime() + i * 5 * 60000), v:v});
+    }
+    return out;
+  }
+
+  function predictedFromTrio(ds) {
+    var out = [];
+    if (!ds || !ds.openaps) return out;
+    var o = ds.openaps;
+    var sug = o.suggested || null;
+    var enc = o.enacted || null;
+    var src = sug && sug.predBGs ? sug : (enc && enc.predBGs ? enc : null);
+    if (!src || !src.predBGs) return out;
+    var start = when(src.timestamp || src.deliverAt) || recordDate(ds);
+    var p = src.predBGs;
+    var pts;
+    pts = arrayPrediction(p.COB, start);
+    if (pts.length) out.push({name:'COB', points:pts, color:'#ffae42', dash:[7,5]});
+    pts = arrayPrediction(p.IOB, start);
+    if (pts.length) out.push({name:'IOB', points:pts, color:'#66aaff', dash:[3,5]});
+    pts = arrayPrediction(p.ZT, start);
+    if (pts.length) out.push({name:'ZT', points:pts, color:'#35d1d1', dash:[10,5]});
+    return out;
+  }
+
+  function sourceDateLoop(ds) {
+    if (!ds) return null;
+    return recordDate(ds.loop) || recordDate(ds);
+  }
+
+  function sourceDateTrio(ds) {
+    if (!ds) return null;
+    return recordDate(ds) || recordDate(ds.openaps && ds.openaps.suggested) || recordDate(ds.openaps);
+  }
+
+  function setSourceStatus(mode, ds) {
     var el = document.getElementById('loopStatus');
     var ageEl = document.getElementById('loopAge');
-    if (!ds || !ds.loop) {
-      el.innerHTML = 'LOOP --';
-      el.className = '';
-      ageEl.innerHTML = 'no Loop device status yet';
+    var d = null, a = null, label = 'AID --', closed = null;
+
+    if (mode === 'trio' && ds && ds.openaps) {
+      d = sourceDateTrio(ds);
+      label = 'TRIO';
+      closed = String(ds.openaps.dosingMode || '').toLowerCase();
+      if (closed === 'closed') label += ' CLOSED';
+      else if (closed === 'open') label += ' OPEN';
+    } else if (mode === 'loop' && ds && ds.loop) {
+      d = sourceDateLoop(ds);
+      label = 'LOOP';
+      closed = firstPath(ds.loop, [['closedLoop'],['closed_loop'],['isClosedLoop']]);
+      if (closed === true) label += ' CLOSED';
+      if (closed === false) label += ' OPEN';
+    } else {
+      el.innerHTML = label;
+      el.className = 'bad';
+      ageEl.innerHTML = 'no current Loop/Trio device status';
       return;
     }
-    var d = recordDate(ds.loop) || recordDate(ds);
-    var a = ageMinutes(d);
-    var closed = firstPath(ds.loop, [['closedLoop'],['closed_loop'],['isClosedLoop']]);
-    var label = 'LOOP';
-    if (closed === true) label += ' CLOSED';
-    if (closed === false) label += ' OPEN';
+
+    a = ageMinutes(d);
     if (a !== null && a <= 5) el.className = 'good';
     else if (a !== null && a <= 15) el.className = 'warn';
     else el.className = 'bad';
@@ -291,28 +371,7 @@
     ageEl.innerHTML = ageText(d);
   }
 
-  function updateLoop(dsArr, treatments) {
-    lastDeviceData = dsArr;
-    var ds = latestWith(dsArr, 'loop');
-    var loop = ds && ds.loop ? ds.loop : null;
-    var iob = null, cob = null, rec = null, reservoir = null, basal = null;
-
-    if (loop) {
-      iob = num(firstPath(loop, [['iob','iob'],['iob','value'],['insulinOnBoard'],['iob']]));
-      if (iob === null) iob = findNumberByKey(loop, ['insulinOnBoard'], 0);
-
-      cob = num(firstPath(loop, [['cob','cob'],['cob','value'],['carbsOnBoard'],['cob']]));
-      if (cob === null) cob = findNumberByKey(loop, ['carbsOnBoard'], 0);
-
-      rec = num(firstPath(loop, [['recommendedBolus','amount'],['recommendedBolus'],['recommendation','bolus'],['bolusRecommendation']]));
-    }
-
-    var pumpDS = latestWith(dsArr, 'pump');
-    if (pumpDS && pumpDS.pump) {
-      reservoir = num(firstPath(pumpDS.pump, [['reservoir'],['reservoir','units'],['status','reservoir']]));
-      basal = num(firstPath(pumpDS.pump, [['basal','rate'],['status','basal','rate']]));
-    }
-
+  function getTreatmentState(treatments) {
     var activeTemp = null, lastBolus = null, lastBolusDate = null, i, t, td, dur, end;
     var now = new Date();
     treatments = treatments || [];
@@ -328,31 +387,124 @@
         if (!lastBolusDate || td > lastBolusDate) { lastBolus=t; lastBolusDate=td; }
       }
     }
-    if (activeTemp) {
-      basal = num(activeTemp.obj.rate);
-      if (basal === null) basal = num(activeTemp.obj.absolute);
-      document.getElementById('basalSub').innerHTML = 'U/hr · temp';
+    return {activeTemp:activeTemp, lastBolus:lastBolus, lastBolusDate:lastBolusDate};
+  }
+
+  function activeTrioTempRate(ds) {
+    if (!ds || !ds.openaps) return null;
+    var now = new Date();
+    var lt = firstPath(ds.openaps, [['iob','lastTemp']]);
+    var d, dur, end, r;
+    if (lt) {
+      d = recordDate(lt);
+      dur = num(lt.duration);
+      r = num(lt.rate);
+      if (d && dur !== null && r !== null) {
+        end = new Date(d.getTime() + dur * 60000);
+        if (end > now) return r;
+      }
+    }
+    var enc = ds.openaps.enacted;
+    if (enc && enc.received === true) {
+      d = when(enc.timestamp || enc.deliverAt);
+      dur = num(enc.duration);
+      r = num(enc.rate);
+      if (d && dur !== null && r !== null && dur > 0) {
+        end = new Date(d.getTime() + dur * 60000);
+        if (end > now) return r;
+      }
+    }
+    return null;
+  }
+
+  function updateAID(dsArr, treatments) {
+    lastDeviceData = dsArr;
+    var loopDS = latestWith(dsArr, 'loop');
+    var trioDS = latestTrio(dsArr);
+    var loopDate = sourceDateLoop(loopDS);
+    var trioDate = sourceDateTrio(trioDS);
+    var mode = null, ds = null;
+
+    if (trioDS && (!loopDS || !loopDate || (trioDate && trioDate >= loopDate))) {
+      mode = 'trio'; ds = trioDS;
+    } else if (loopDS) {
+      mode = 'loop'; ds = loopDS;
+    }
+
+    var iob = null, cob = null, rec = null, reservoir = null, basal = null;
+    var tstate = getTreatmentState(treatments);
+    var activeTemp = tstate.activeTemp;
+
+    if (mode === 'trio' && ds && ds.openaps) {
+      iob = num(firstPath(ds.openaps, [['iob','iob'],['suggested','IOB'],['enacted','IOB']]));
+      cob = num(firstPath(ds.openaps, [['suggested','COB'],['enacted','COB']]));
+      rec = num(ds.openaps.recommendedBolus);
+
+      if (activeTemp) {
+        basal = num(activeTemp.obj.rate);
+        if (basal === null) basal = num(activeTemp.obj.absolute);
+      }
+      if (basal === null) basal = activeTrioTempRate(ds);
+
+      /* Trio currently uploads reservoir: 0 as a placeholder in openaps data.
+         Do not display that as an empty pod. */
+      reservoir = null;
+
+      document.getElementById('predictionLabel').innerHTML = 'Trio predictions (COB / IOB / ZT)';
+    } else if (mode === 'loop' && ds && ds.loop) {
+      var loop = ds.loop;
+      iob = num(firstPath(loop, [['iob','iob'],['iob','value'],['insulinOnBoard'],['iob']]));
+      if (iob === null) iob = findNumberByKey(loop, ['insulinOnBoard'], 0);
+
+      cob = num(firstPath(loop, [['cob','cob'],['cob','value'],['carbsOnBoard'],['cob']]));
+      if (cob === null) cob = findNumberByKey(loop, ['carbsOnBoard'], 0);
+
+      rec = num(firstPath(loop, [['recommendedBolus','amount'],['recommendedBolus'],['recommendation','bolus'],['bolusRecommendation']]));
+
+      var pumpDS = latestPumpWithReservoir(dsArr);
+      if (pumpDS && pumpDS.pump) {
+        reservoir = num(firstPath(pumpDS.pump, [['reservoir'],['reservoir','units'],['status','reservoir']]));
+        basal = num(firstPath(pumpDS.pump, [['basal','rate'],['status','basal','rate']]));
+      }
+
+      if (activeTemp) {
+        basal = num(activeTemp.obj.rate);
+        if (basal === null) basal = num(activeTemp.obj.absolute);
+      }
+      if (basal === null) basal = num(firstPath(loop, [['enacted','rate'],['recommendedTempBasal','rate'],['basalAdjustment','rate']]));
+
+      document.getElementById('predictionLabel').innerHTML = 'Loop prediction';
     } else {
-      document.getElementById('basalSub').innerHTML = 'U/hr';
+      document.getElementById('predictionLabel').innerHTML = 'prediction';
     }
-    if (basal === null && loop) {
-      basal = num(firstPath(loop, [['enacted','rate'],['recommendedTempBasal','rate'],['basalAdjustment','rate']]));
-    }
+
+    if (activeTemp && basal !== null) document.getElementById('basalSub').innerHTML = 'U/hr · temp';
+    else if (mode === 'trio' && basal !== null) document.getElementById('basalSub').innerHTML = 'U/hr · temp';
+    else document.getElementById('basalSub').innerHTML = 'U/hr';
 
     document.getElementById('iob').innerHTML = iob === null ? '--' : iob.toFixed(2);
     document.getElementById('cob').innerHTML = cob === null ? '--' : Math.round(cob);
     document.getElementById('recBolus').innerHTML = rec === null ? '--' : rec.toFixed(2);
     document.getElementById('reservoir').innerHTML = reservoir === null ? '--' : reservoir.toFixed(1);
     document.getElementById('basal').innerHTML = basal === null ? '--' : basal.toFixed(2);
-    if (lastBolus) {
-      document.getElementById('lastBolus').innerHTML = num(lastBolus.insulin).toFixed(2);
-      document.getElementById('lastBolusSub').innerHTML = ageText(lastBolusDate);
+
+    if (tstate.lastBolus) {
+      document.getElementById('lastBolus').innerHTML = num(tstate.lastBolus.insulin).toFixed(2);
+      document.getElementById('lastBolusSub').innerHTML = ageText(tstate.lastBolusDate);
     } else {
       document.getElementById('lastBolus').innerHTML = '--';
       document.getElementById('lastBolusSub').innerHTML = '';
     }
-    setLoopStatus(ds);
-    return loop;
+
+    setSourceStatus(mode, ds);
+
+    if (mode === 'trio') {
+      return {mode:'trio', series:predictedFromTrio(ds)};
+    }
+    if (mode === 'loop') {
+      return {mode:'loop', series:[{name:'Loop', points:predictedFromLoop(ds.loop), color:'#aaa', dash:[7,6]}]};
+    }
+    return {mode:null, series:[]};
   }
 
   function resizeCanvas(canvas) {
@@ -362,7 +514,7 @@
     if (canvas.width !== w || canvas.height !== h) { canvas.width=w; canvas.height=h; }
   }
 
-  function drawChart(entries, predicted) {
+  function drawChart(entries, series) {
     var c = document.getElementById('chart');
     resizeCanvas(c);
     var ctx = c.getContext('2d');
@@ -374,7 +526,7 @@
       ctx.fillStyle='#888'; ctx.font='16px sans-serif'; ctx.fillText('Waiting for glucose history…',20,35); return;
     }
 
-    var pts=[], i, d, v;
+    var pts=[], i, j, d, v;
     for (i=0;i<entries.length;i++) {
       d=recordDate(entries[i]); v=num(entries[i].sgv);
       if (d && v!==null) pts.push({t:d,v:v});
@@ -383,15 +535,24 @@
     var now = new Date();
     var minT = new Date(now.getTime()-3*60*60*1000);
     var maxT = now;
-    if (predicted && predicted.length) {
-      for (i=0;i<predicted.length;i++) if (predicted[i].t>maxT) maxT=predicted[i].t;
+    series = series || [];
+    for (i=0;i<series.length;i++) {
+      for (j=0;j<series[i].points.length;j++) {
+        if (series[i].points[j].t > maxT) maxT = series[i].points[j].t;
+      }
     }
 
-    var all=pts.slice(0);
-    if (predicted) all=all.concat(predicted);
     var minV=1000,maxV=0;
-    for (i=0;i<all.length;i++) {
-      if (all[i].t >= minT) { minV=Math.min(minV,all[i].v); maxV=Math.max(maxV,all[i].v); }
+    for (i=0;i<pts.length;i++) {
+      if (pts[i].t >= minT) { minV=Math.min(minV,pts[i].v); maxV=Math.max(maxV,pts[i].v); }
+    }
+    for (i=0;i<series.length;i++) {
+      for (j=0;j<series[i].points.length;j++) {
+        if (series[i].points[j].t >= minT) {
+          minV=Math.min(minV,series[i].points[j].v);
+          maxV=Math.max(maxV,series[i].points[j].v);
+        }
+      }
     }
     if (minV===1000) { minV=60; maxV=220; }
     minV=Math.max(40,Math.floor((minV-20)/20)*20);
@@ -419,22 +580,24 @@
     }
     ctx.stroke();
 
-    if (predicted && predicted.length) {
+    for (i=0;i<series.length;i++) {
+      if (!series[i].points || !series[i].points.length) continue;
       ctx.save();
-      ctx.strokeStyle='#aaa'; ctx.lineWidth=3;
-      if (ctx.setLineDash) ctx.setLineDash([7,6]);
+      ctx.strokeStyle=series[i].color || '#aaa';
+      ctx.lineWidth=2.5;
+      if (ctx.setLineDash) ctx.setLineDash(series[i].dash || [7,6]);
       ctx.beginPath(); started=false;
-      for (i=0;i<predicted.length;i++) {
-        if (predicted[i].t<minT) continue;
-        if (!started) { ctx.moveTo(x(predicted[i].t),y(predicted[i].v)); started=true; }
-        else ctx.lineTo(x(predicted[i].t),y(predicted[i].v));
+      for (j=0;j<series[i].points.length;j++) {
+        if (series[i].points[j].t<minT) continue;
+        if (!started) { ctx.moveTo(x(series[i].points[j].t),y(series[i].points[j].v)); started=true; }
+        else ctx.lineTo(x(series[i].points[j].t),y(series[i].points[j].v));
       }
       ctx.stroke(); ctx.restore();
     }
 
     ctx.fillStyle='#777'; ctx.font='12px sans-serif';
     var t1=minT, t2=new Date((minT.getTime()+maxT.getTime())/2), t3=maxT;
-    function tm(d){ var h=d.getHours(),m=d.getMinutes(); return (h<10?'0':'')+h+':'+(m<10?'0':'')+m; }
+    function tm(dt){ var h=dt.getHours(),m=dt.getMinutes(); return (h<10?'0':'')+h+':'+(m<10?'0':'')+m; }
     ctx.fillText(tm(t1),L,H-6);
     var mid=tm(t2); ctx.fillText(mid,Math.max(L,x(t2)-18),H-6);
     var end=tm(t3); ctx.fillText(end,Math.max(L,W-R-36),H-6);
@@ -454,7 +617,6 @@
         var latest=entries[0], gv=mmol(latest.sgv), ld=recordDate(latest);
         document.getElementById('glucose').innerHTML = gv===null?'--':gv.toFixed(1);
         document.getElementById('arrow').innerHTML = arrow(latest.direction);
-        document.getElementById('age').innerHTML = ageText(ld);
         var delta=null;
         if (entries.length>1 && num(entries[0].sgv)!==null && num(entries[1].sgv)!==null) delta=(entries[0].sgv-entries[1].sgv)/18;
         document.getElementById('delta').innerHTML=(delta===null?'--':(delta>=0?'+':'')+delta.toFixed(1))+' mmol/L <span id="age">'+ageText(ld)+'</span>';
@@ -463,14 +625,14 @@
         g.className = a!==null && a>12 ? 'bad' : '';
       }
 
-      xhrJSON('/api/v1/devicestatus.json?count=10', function(err2, ds) {
+      xhrJSON('/api/v1/devicestatus.json?count=50', function(err2, ds) {
         ds = err2 ? [] : (ds || []);
-        xhrJSON('/api/v1/treatments.json?count=60', function(err3, treatments) {
+        xhrJSON('/api/v1/treatments.json?count=80', function(err3, treatments) {
           treatments = err3 ? [] : (treatments || []);
-          var loop=updateLoop(ds,treatments);
-          drawChart(entries,predictedFrom(loop));
+          var aid=updateAID(ds,treatments);
+          drawChart(entries,aid.series);
           document.getElementById('updated').innerHTML='display refreshed '+new Date().toLocaleTimeString();
-          if (err2) document.getElementById('message').innerHTML='Glucose is live, but Loop device status could not be read: '+err2;
+          if (err2) document.getElementById('message').innerHTML='Glucose is live, but Loop/Trio device status could not be read: '+err2;
         });
       });
     });
@@ -509,9 +671,8 @@
     var d=document.getElementById('debug');
     if (d.className==='hidden') {
       d.className='';
-      var sample=lastDeviceData && lastDeviceData.length ? lastDeviceData : null;
-      d.innerHTML='Latest Nightscout device-status shape (for troubleshooting only):\n\n'+
-        (sample ? JSON.stringify(sample,null,2) : 'No device-status record received.');
+      d.innerHTML='Latest Nightscout device-status records (for troubleshooting only):\n\n'+
+        (lastDeviceData && lastDeviceData.length ? JSON.stringify(lastDeviceData,null,2) : 'No device-status records received.');
       this.innerHTML='Hide data check';
     } else {
       d.className='hidden'; this.innerHTML='Show data check';
